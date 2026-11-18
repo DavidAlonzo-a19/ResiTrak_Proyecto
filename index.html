@@ -118,6 +118,8 @@ var SCHEMA={
  facturas:{pk:'id',unique:['uuid','pago_id'],fk:{pago_id:'pagos'},req:['pago_id','uuid','total']},
  documentos:{pk:'id',unique:['folio'],fk:{solicitud_id:'solicitudes'},req:['solicitud_id','tipo','folio','hash'],check:{tipo:['constancia','carta']}},
  bitacora:{pk:'id',fk:{solicitud_id:'solicitudes'},req:['accion','usuario','rol']},
+ padron:{pk:'control',req:['control','nombre','carrera'],check:{carrera:CARRERAS}},
+ pendientes:{pk:'control',req:['control','usuario_hash','salt','correo','codigo','vence']},
  correos:{pk:'id',fk:{usuario_id:'usuarios'},req:['usuario_id','asunto']}
 };
 function dbErr(m){var e=new Error(m);e.code='DB';return e}
@@ -135,9 +137,9 @@ function insert(t,row){
   all(t).push(row);persist();return row;
 }
 function update(t,row,patch){var S=SCHEMA[t];Object.keys(patch).forEach(function(k){if(k==='id'||k===S.pk)return;if(S.check&&S.check[k]&&S.check[k].indexOf(patch[k])<0)throw dbErr('Valor no permitido en '+t+'.'+k);row[k]=patch[k]});persist();return row}
-function persist(){try{localStorage.setItem('resitrack_db_v2',JSON.stringify(DB))}catch(e){}}
-function loadDb(){try{var s=localStorage.getItem('resitrack_db_v2');if(s){DB=JSON.parse(s);return true}}catch(e){}return false}
-function resetDb(){try{localStorage.removeItem('resitrack_db_v2')}catch(e){}DB={t:{},meta:{seq:{},clock:0}};seed()}
+function persist(){try{localStorage.setItem('resitrack_db_v3',JSON.stringify(DB))}catch(e){}}
+function loadDb(){try{var s=localStorage.getItem('resitrack_db_v3');if(s){DB=JSON.parse(s);return true}}catch(e){}return false}
+function resetDb(){try{localStorage.removeItem('resitrack_db_v3')}catch(e){}DB={t:{},meta:{seq:{},clock:0}};seed()}
 
 /* ===== Servicios del sistema (reglas de negocio y permisos) ===== */
 var ROLE_NAME={residente:'Residente',finanzas:'Recursos Financieros',escolares:'Servicios Escolares',coord:'Coordinación de carrera',vinculacion:'Gestión Tecnológica y Vinculación'};
@@ -153,7 +155,34 @@ function resOf(sol){return find('residentes',function(r){return r.control===sol.
 function requisitos(r){return[
  ['Servicio social acreditado',r.servicio_social],['Actividades complementarias acreditadas',r.actividades],
  ['Al menos 80 % de los créditos ('+r.creditos+' % actual)',r.creditos>=80],['Ninguna asignatura en curso especial',!r.curso_especial]]}
-var Svc={
+ var Svc={
+ crearCuenta:function(d){
+  var c=String(d.control||'').trim(),co=String(d.correo||'').trim().toLowerCase(),p=String(d.pass||''),p2=String(d.pass2||'');
+  if(!/^\d{8}$/.test(c))throw bad('El número de control debe tener 8 dígitos.');
+  if(find('usuarios',function(x){return x.usuario===c}))throw bad('Ya existe una cuenta con ese número de control. Inicia sesión.');
+  var al=find('padron',function(x){return x.control===c});
+  if(!al)throw bad('Ese número de control no aparece en el padrón de alumnos del Instituto. Revisa que esté bien escrito.');
+  if(!/^[^\s@]+@[^\s@]+\.tecnm\.mx$/.test(co))throw bad('Escribe tu correo institucional, que termina en .tecnm.mx.');
+  if(find('residentes',function(x){return x.correo.toLowerCase()===co}))throw bad('Ese correo ya está ligado a otra cuenta.');
+  if(p.length<8)throw bad('La contraseña debe tener al menos 8 caracteres.');
+  if(!/[a-z]/.test(p)||!/[A-Z]/.test(p)||!/\d/.test(p)||!/[^A-Za-z0-9]/.test(p))throw bad('La contraseña necesita mayúscula, minúscula, número y un símbolo (por ejemplo !).');
+  if(p.indexOf(c)>=0)throw bad('La contraseña no debe contener tu número de control.');
+  if(p!==p2)throw bad('Las dos contraseñas no coinciden.');
+  var salt='u'+Math.random().toString(36).slice(2,10),code=String(Math.floor(100000+Math.random()*900000));
+  var ex=find('pendientes',function(x){return x.control===c});if(ex)all('pendientes').splice(all('pendientes').indexOf(ex),1);
+  insert('pendientes',{control:c,usuario_hash:sha256(salt+p),salt:salt,correo:co,codigo:code,vence:NOW()+10*60000,intentos:0});
+  return{control:c,correo:co,codigo:code};
+ },
+ verificarCuenta:function(control,codigo){
+  var pe=find('pendientes',function(x){return x.control===control});if(!pe)throw bad('No hay una cuenta pendiente de verificar. Empieza de nuevo.');
+  if(pe.vence<NOW()){all('pendientes').splice(all('pendientes').indexOf(pe),1);persist();throw bad('El código venció (dura 10 minutos). Crea la cuenta otra vez.')}
+  if(!/^\d{6}$/.test(String(codigo||'').trim()))throw bad('El código tiene 6 dígitos.');
+  if(String(codigo).trim()!==pe.codigo){pe.intentos++;if(pe.intentos>=3){all('pendientes').splice(all('pendientes').indexOf(pe),1);persist();throw bad('Demasiados intentos. Crea la cuenta otra vez.')}persist();throw bad('El código no es correcto. Intento '+pe.intentos+' de 3.')}
+  var al=find('padron',function(x){return x.control===control});
+  var u=insert('usuarios',{usuario:control,nombre:al.nombre,rol:'residente',carrera:null,salt:pe.salt,hash:pe.usuario_hash,intentos:0});
+  insert('residentes',{control:control,usuario_id:u.id,nombre:al.nombre,carrera:al.carrera,correo:pe.correo,creditos:al.creditos,servicio_social:al.servicio_social,actividades:al.actividades,curso_especial:al.curso_especial});
+  all('pendientes').splice(all('pendientes').indexOf(pe),1);persist();return true;
+ },
  login:function(usuario,pass){
   usuario=String(usuario||'').trim();
   if(!usuario||!pass)throw bad('Escribe tu usuario y tu contraseña.');
@@ -329,6 +358,7 @@ function seed(){
   user('coord_civil','Coordinación de Ingeniería Civil','coord','Coord2026!',CARRERAS[1]);
   user('coord_industrial','Coordinación de Ingeniería Industrial','coord','Coord2026!',CARRERAS[2]);
   user('vinculacion','Gestión Tecnológica y Vinculación','vinculacion','Vincula2026!');
+  [['24000006','Alumno Padrón 6',CARRERAS[0],86,true,true,false],['24000007','Alumno Padrón 7',CARRERAS[1],81,true,true,false],['24000008','Alumno Padrón 8',CARRERAS[2],70,true,true,false]].forEach(function(a){insert('padron',{control:a[0],nombre:a[1],carrera:a[2],creditos:a[3],servicio_social:a[4],actividades:a[5],curso_especial:a[6]})});
   function S(u){return find('usuarios',function(x){return x.usuario===u})}
   function sess(u){var x=S(u);return{id:x.id,usuario:x.usuario,rol:x.rol,carrera:x.carrera}}
   function sol(c){return where('solicitudes',function(s){return s.control===c})[0]}
@@ -390,13 +420,19 @@ function topbar(){
 }
 function alertHtml(){if(!UI.msg)return'';var h='<div class="alert '+(UI.msgType==='ok'?'okk':(UI.msgType==='info'?'info':'err'))+'" role="alert">'+esc(UI.msg)+'</div>';return h}
 function setMsg(m,t){UI.msg=m;UI.msgType=t||'err'}
+function authCard(){
+  var m=UI.auth||'login',f=UI.f||{};
+  if(m==='crear')return '<div class="card"><h2>Crear mi cuenta de residente</h2><p class="small" style="margin:0">Validamos tu número de control contra el padrón de alumnos y tu correo con un código.</p><form id="f-crear" autocomplete="off"><label for="n-c">Número de control</label><input id="n-c" inputmode="numeric" maxlength="8" value="'+esc(f.control||'')+'"><label for="n-m">Correo institucional</label><input id="n-m" type="email" placeholder="tu.nombre@matehuala.tecnm.mx" value="'+esc(f.correo||'')+'"><label for="n-p">Contraseña</label><input id="n-p" type="password" autocomplete="new-password"><p class="hint">Mínimo 8 caracteres con mayúscula, minúscula, número y símbolo.</p><label for="n-q">Repite la contraseña</label><input id="n-q" type="password" autocomplete="new-password">'+alertHtml()+'<button class="btn" type="submit">Crear cuenta</button><button class="btn alt" data-a="auth" data-m="login" type="button">Ya tengo cuenta</button></form></div>';
+  if(m==='codigo'){var pe=UI.pend;return '<div class="card"><h2>Verifica tu correo</h2><p class="small" style="margin:0 0 8px">Enviamos un código de 6 dígitos a <b>'+esc(pe.correo)+'</b>. Dura 10 minutos.</p><div class="mail"><b>Bandeja simulada · Código de verificación ResiTrack</b><br>Tu código es <b class="mono" style="font-size:18px">'+esc(pe.codigo)+'</b><br><small>En producción llegaría a tu correo real; aquí se muestra para la demostración.</small></div><form id="f-cod" autocomplete="off"><label for="n-k">Código</label><input id="n-k" inputmode="numeric" maxlength="6">'+alertHtml()+'<button class="btn" type="submit">Verificar y crear cuenta</button><button class="btn alt" data-a="auth" data-m="crear" type="button">Volver</button></form></div>'}
+  return '<div class="card"><h2>Iniciar sesión</h2><p class="small" style="margin:0 0 4px">Residentes: usa tu número de control. Personal: usa tu usuario institucional.</p><form id="f-login" autocomplete="off"><label for="lu">Usuario</label><input id="lu" inputmode="text" autocomplete="username" value="'+esc(f.login||'')+'"><label for="lp">Contraseña</label><input id="lp" type="password" autocomplete="current-password">'+alertHtml()+'<button class="btn" type="submit">Entrar</button></form><button class="btn alt" data-a="auth" data-m="crear" type="button">Soy residente y no tengo cuenta</button></div>';
+}
 function vLogin(){
   var h='<div class="hero"><div><h1>Tu trámite de residencia, paso a paso y sin vueltas</h1><p class="lead">Registra tu solicitud, paga, recibe tu factura y tus documentos desde un solo lugar. Cada área trabaja con su propia cuenta y tú ves en qué paso vas.</p><ul class="how" style="grid-template-columns:repeat(5,1fr);margin:0">';
   ['Registra','Paga','Constancia','Autorización','Carta'].forEach(function(t,i){h+='<li>'+STEP_IC[i]+t+'</li>'});
   h+='</ul></div><div>'+hero()+'</div></div>';
-  h+='<div class="grid two"><div class="card"><h2>Iniciar sesión</h2><p class="small" style="margin:0 0 4px">Residentes: usa tu número de control. Personal: usa tu usuario institucional.</p><form id="f-login" autocomplete="off"><label for="lu">Usuario</label><input id="lu" inputmode="text" autocomplete="username"><label for="lp">Contraseña</label><input id="lp" type="password" autocomplete="current-password">'+alertHtml()+'<button class="btn" type="submit">Entrar</button></form></div>';
+  h+='<div class="grid two">'+authCard();
   h+='<div><div class="card"><h2>Cuentas de demostración</h2><p class="small" style="margin:0 0 6px">Datos de prueba. Toca una fila para llenar el acceso.</p><div class="scroll"><table class="accs"><thead><tr><th>Rol</th><th>Usuario</th><th>Contraseña</th></tr></thead><tbody>';
-  [['Residente (cumple requisitos)','24000001','Resi2026!'],['Residente (no cumple)','24000003','Resi2026!'],['Recursos Financieros','finanzas','Finanzas2026!'],['Servicios Escolares','escolares','Escolares2026!'],['Coordinación de Sistemas','coord_sistemas','Coord2026!'],['Coordinación de Civil','coord_civil','Coord2026!'],['Vinculación','vinculacion','Vincula2026!']].forEach(function(a){h+='<tr data-fill="'+a[1]+'|'+a[2]+'" style="cursor:pointer"><td>'+a[0]+'</td><td><code>'+a[1]+'</code></td><td><code>'+a[2]+'</code></td></tr>'});
+  [['Residente (cumple requisitos)','24000001','Resi2026!'],['Residente (no cumple)','24000003','Resi2026!'],['Crear cuenta nueva (padrón)','24000006 · 07 · 08','tú la eliges'],['Recursos Financieros','finanzas','Finanzas2026!'],['Servicios Escolares','escolares','Escolares2026!'],['Coordinación de Sistemas','coord_sistemas','Coord2026!'],['Coordinación de Civil','coord_civil','Coord2026!'],['Vinculación','vinculacion','Vincula2026!']].forEach(function(a){h+='<tr data-fill="'+a[1]+'|'+a[2]+'" style="cursor:pointer"><td>'+a[0]+'</td><td><code>'+a[1]+'</code></td><td><code>'+a[2]+'</code></td></tr>'});
   h+='</tbody></table></div></div><div class="card"><h2>Verificar un documento</h2><p class="small" style="margin:0 0 4px">Escribe el folio de una constancia, carta o factura (por ejemplo CAC-2026-0001).</p><form id="f-ver"><label for="fv">Folio</label><input id="fv" placeholder="CAC-2026-0001"><button class="btn alt" type="submit">Verificar</button></form><div id="ver-out"></div></div></div></div>';
   return h;
 }
@@ -552,6 +588,8 @@ function run(fn,ok){try{fn();if(ok)toast(ok);return true}catch(e){setMsg(e.messa
 document.addEventListener('submit',function(ev){
   ev.preventDefault();var id=ev.target.id;UI.msg=null;UI.msgFis=null;
   if(id==='f-login'){try{SESS=Svc.login($('lu').value,$('lp').value);try{sessionStorage.setItem('resitrack_sess',JSON.stringify(SESS))}catch(e){}UI={view:'home',tab:'tramite',pay:'tarjeta'};render()}catch(e){setMsg(e.message);render();$('lu').value=''}return}
+  if(id==='f-crear'){UI.f={control:$('n-c').value,correo:$('n-m').value};try{UI.pend=Svc.crearCuenta({control:$('n-c').value,correo:$('n-m').value,pass:$('n-p').value,pass2:$('n-q').value});UI.auth='codigo';UI.msg=null}catch(e){setMsg(e.message)}render();return}
+  if(id==='f-cod'){try{Svc.verificarCuenta(UI.pend.control,$('n-k').value);UI.f={login:UI.pend.control};UI.auth='login';UI.pend=null;setMsg('Cuenta creada. Inicia sesión con tu número de control y tu contraseña.','ok')}catch(e){setMsg(e.message);if(!find('pendientes',function(x){return UI.pend&&x.control===UI.pend.control})){UI.auth='crear'}}render();return}
   if(id==='f-ver'){var o=$('ver-out');try{var d=Svc.verificar($('fv').value);o.innerHTML='<div class="alert '+(d.ok?'okk':'err')+'" role="status"><b>'+(d.ok?'Documento auténtico':'La huella no coincide')+'</b><br>Tipo: '+esc(d.tipo)+' · Folio: '+esc(d.folio)+'<br>Emitido el '+ftime(d.fecha)+' por '+esc(d.por||'el sistema')+(d.carrera?'<br>Carrera: '+esc(d.carrera):'')+(d.uuid?'<br>UUID: '+esc(d.uuid):'')+'<br>Datos personales no se muestran.</div>'}catch(e){o.innerHTML='<div class="alert err" role="alert">'+esc(e.message)+'</div>'}return}
   if(id==='f-reg'){var sol;if(run(function(){sol=Svc.registrar(SESS,{control:$('g-ctl').value,correo:$('g-cor').value,proyecto:$('g-pro').value,empresa:$('g-emp').value})},'Solicitud registrada. Se generó tu referencia de pago.')){UI.view='pago';UI.msg=null}render();return}
   if(id==='f-card'){var s=solOf(SESS);var ok=run(function(){Svc.pagarTarjeta(SESS,s.id,{numero:$('c-n').value,vence:$('c-v').value,cvv:$('c-c').value,nombre:$('c-m').value})},'Pago aprobado (simulado).');render();return}
@@ -562,6 +600,7 @@ document.addEventListener('click',function(ev){
   var tr=ev.target.closest('[data-fill]');if(tr){var p=tr.dataset.fill.split('|');$('lu').value=p[0];$('lp').value=p[1];return}
   var b=ev.target.closest('[data-a]');if(!b)return;var a=b.dataset.a;UI.msg=null;UI.msgFis=null;
   if(a==='logout'){SESS=null;try{sessionStorage.removeItem('resitrack_sess')}catch(e){}UI={view:'home',tab:'tramite',pay:'tarjeta'};render();return}
+  if(a==='auth'){UI.auth=b.dataset.m;render();return}
   if(a==='go'){UI.view=b.dataset.v;render();return}
   if(a==='tab'){UI.tab=b.dataset.t;render();return}
   if(a==='paymode'){UI.pay=b.dataset.m;render();return}
